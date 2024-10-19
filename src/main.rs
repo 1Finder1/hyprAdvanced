@@ -1,25 +1,25 @@
-use std::sync::{Arc, Mutex};
-use hyprland::dispatch::{DispatchType, WindowIdentifier};
+use crate::event_listener::EventListener;
+use crate::rename_workspace::rename_workspace;
+use crate::types::HyprlandEvent;
 use hyprland::data::Client;
 use hyprland::dispatch;
 use hyprland::dispatch::{Dispatch, WorkspaceIdentifierWithSpecial};
-use hyprland::event_listener::EventListener;
+use hyprland::dispatch::{DispatchType, WindowIdentifier};
 use hyprland::prelude::HyprDataActiveOptional;
-use hyprland::shared::{Address, WorkspaceId, WorkspaceType};
-use regex::Regex;
+use hyprland::shared::{Address, WorkspaceId};
+use std::sync::{Arc, Mutex};
 
-mod events;
 mod event_listener;
+mod rename_workspace;
+mod types;
 
 struct PIPWindow {
-    pub address: Option<Address>
+    pub address: Option<Address>,
 }
 
 impl PIPWindow {
     fn new() -> Self {
-        Self {
-            address: None
-        }
+        Self { address: None }
     }
 
     fn set_address(&mut self, address: Option<Address>) {
@@ -31,64 +31,57 @@ impl PIPWindow {
     }
 }
 
+fn get_active_window() -> Option<Client> {
+    Client::get_active().expect("Could not get active window")
+}
 
 fn main() {
     let pip_manager = Arc::new(Mutex::new(PIPWindow::new()));
-    let mut event_listener = EventListener::new();
 
-    let (event_tx, event_rx) = crossbeam_channel::bounded::<Event>(32);
+    let (event_tx, event_rx) = crossbeam_channel::bounded::<HyprlandEvent>(32);
 
-    let r:Regex = Regex::new("activewindowv2>>(?P<address>.*)").unwrap();
+    let listener = EventListener::new(event_tx);
 
-    println!("{:?}", r.captures("activewindowv2>>57d729ee6210").unwrap() );
+    listener.start_loop();
 
-    event_listener.add_active_window_change_handler({
-        let pip_manager = pip_manager.clone();
-        move |data| {
-            let active_window = Client::get_active().unwrap();
-            println!("active_window {data:?}");
+    while let Ok(event) = event_rx.recv() {
+        rename_workspace();
 
-            if let Some(active) = active_window {
-                if active.class.is_empty() && active.floating {
-                    pip_manager.lock().unwrap().set_address(Some(active.address))
+        match event {
+            HyprlandEvent::ActiveWindowV2(_) => {
+                let active = get_active_window();
+
+                if let Some(active) = active {
+                    if active.floating && active.class.is_empty() {
+                        pip_manager
+                            .lock()
+                            .unwrap()
+                            .set_address(Some(active.address))
+                    }
                 }
             }
-        }
-    });
-
-    event_listener.add_window_close_handler({
-        let pip_manager = pip_manager.clone();
-        move |data| {
-            println!("{data:?}");
-            let mut pip = pip_manager.lock().unwrap();
-            let address = pip.address.clone();
-
-            if address.is_none() {return;}
-
-            if data == address.unwrap() {
-                pip.set_address(None);
-            }
-        }
-    });
-
-    event_listener.add_workspace_change_handler({
-        let pip_manager = pip_manager.clone();
-        move |id| {
-            let pip = pip_manager.lock().unwrap();
-            if pip.is_none() {
-                return;
-            }
-            match id {
-                WorkspaceType::Regular(id) => {
-                    let _ = dispatch!(MoveToWorkspace,
-                    WorkspaceIdentifierWithSpecial::Id(WorkspaceId::from(id.parse::<i32>().unwrap())),
+            HyprlandEvent::Workspace(id) => {
+                let pip = pip_manager.lock().unwrap();
+                if pip.is_none() {
+                    continue;
+                }
+                dispatch!(
+                    MoveToWorkspaceSilent,
+                    WorkspaceIdentifierWithSpecial::Id(WorkspaceId::from(
+                        id.parse::<i32>().unwrap()
+                    )),
                     Some(WindowIdentifier::Address(pip.address.clone().unwrap()))
-                );
+                )
+                .expect("Failed to move window");
+            }
+            HyprlandEvent::CloseWindow(id) => {
+                let mut pip = pip_manager.lock().unwrap();
+                if let Some(address) = pip.address.clone() {
+                    if address.to_string() == id {
+                        pip.set_address(None)
+                    }
                 }
-                _ => {}
             }
         }
-    });
-
-    event_listener.start_listener().unwrap();
+    }
 }
